@@ -75,27 +75,31 @@ cache keeps repeated turns cheap while still picking up your file edits.
 
 ## Installation
 
-Pick one:
-
-**A. Load directly (quick test)**
+Install as a pi package (recommended). Pi reads the `pi` manifest in
+`package.json` and auto-discovers the extension — no manual copying needed.
 
 ```bash
-pi -e /path/to/pi-prompt-slot/src/index.ts
+# global (available across all projects)
+pi install git:github.com/qoxop/pi-prompt-slot
+
+# or project-local (under .pi/, this project only)
+pi install -l git:github.com/qoxop/pi-prompt-slot
 ```
 
-**B. Copy into your extensions folder** (auto-discovered, hot-reloadable via `/reload`)
+Then `/reload` (or restart pi). Manage it with the usual package commands:
 
 ```bash
-# global
-cp -r /path/to/pi-prompt-slot ~/.pi/agent/extensions/pi-prompt-slot
-# or project-local (trusted projects only)
-cp -r /path/to/pi-prompt-slot .pi/extensions/pi-prompt-slot
+pi list                                  # list installed packages
+pi config                                # enable/disable extensions
+pi update --extensions                   # update installed packages
+pi remove git:github.com/qoxop/pi-prompt-slot
 ```
 
-**C. As a pi package** (this repo already ships a `pi` manifest in `package.json`)
+For a quick test without installing, clone and load it directly:
 
 ```bash
-pi install git:github.com/<you>/pi-prompt-slot     # or npm:@you/pi-prompt-slot
+git clone https://github.com/qoxop/pi-prompt-slot
+pi -e ./pi-prompt-slot/src/index.ts
 ```
 
 ## Development
