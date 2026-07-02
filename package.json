@@ -1,0 +1,28 @@
+{
+  "name": "pi-prompt-slot",
+  "version": "0.1.0",
+  "description": "pi extension that inlines @{./file.md} slot references into prompts, resolved relative to the prompt file's location.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./test/test-resolver.ts ./test/test-wiring.ts",
+    "clean": "rm -rf node_modules",
+    "check": "npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
