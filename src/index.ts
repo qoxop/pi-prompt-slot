@@ -15,20 +15,26 @@
  *   - ❌ User-typed input, prompt templates (`/template`), tool prompts
  *
  * Path resolution:
- *   The system prompt is a concatenation of several files, so after assembly
- *   the origin of any given slot can no longer be recovered. Relative paths
- *   are therefore resolved against the working directory (the project root,
- *   where AGENTS.md typically lives). Absolute paths and `~/`-prefixed paths
- *   are honored as-is. Slots are resolved recursively (a referenced file may
- *   itself contain slots, resolved relative to that file's own directory),
- *   with depth + cycle guards and a per-file size cap.
+ *   Each slot is resolved **relative to the source file that contains it**
+ *   whenever we can identify that source file — the natural, least-surprise
+ *   behavior. Because pi assembles the system prompt from several files and
+ *   drops most origin metadata by the time extensions see it, we recover the
+ *   mapping by content-matching: at handler time we build an index of
+ *   candidate source files (contextFiles from `systemPromptOptions`, plus a
+ *   bounded scan of `.md` files under the cwd), locate each one's byte range
+ *   inside the assembled prompt via `indexOf`, and for every `@{...}` we look
+ *   up which range it falls into and prepend that file's directory to the
+ *   candidate search path. Slots outside any known range fall back to the
+ *   working directory. Absolute and `~/`-prefixed paths are honored as-is.
+ *   Nested slots inside a resolved file are resolved relative to that file's
+ *   directory (unchanged), with depth + cycle guards and a per-file size cap.
  *
  * Hook: `before_agent_start` rewrites `event.systemPrompt` once per user
  * prompt (idempotent; an mtime cache keeps it cheap across turns).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative as relativePath } from "node:path";
 
@@ -39,6 +45,30 @@ const HAS_SLOT = /@\{[^}]+\}/;
 const MAX_DEPTH = 10;
 /** Skip files larger than this to avoid blowing up the context. */
 const MAX_FILE_BYTES = 512 * 1024; // 512 KB
+
+// -- Source-index scan limits (per handler invocation) --
+/** Max directory depth walked when hunting for candidate host files. */
+const SCAN_MAX_DEPTH = 5;
+/** Hard cap on how many files we ever open in one scan. */
+const SCAN_MAX_FILES = 800;
+/** Directories we never descend into. */
+const SCAN_SKIP_DIRS = new Set([
+	"node_modules",
+	".git",
+	"dist",
+	"build",
+	"out",
+	".next",
+	".turbo",
+	".cache",
+	".venv",
+	"venv",
+	"__pycache__",
+	"target",
+	"coverage",
+]);
+/** File extensions considered as potential slot hosts. */
+const SCAN_INCLUDE_EXT = new Set([".md", ".markdown", ".mdx", ".txt"]);
 
 type NotifyLevel = "info" | "warning" | "error";
 
@@ -51,6 +81,8 @@ interface Expansion {
 	error?: string;
 	/** Loaded size in bytes (0 when nothing loaded). */
 	bytes: number;
+	/** Absolute path of the file that hosts this slot, if known. */
+	host?: string;
 }
 
 interface ExpandOutcome {
@@ -61,6 +93,20 @@ interface ExpandOutcome {
 /** In-memory file cache (path -> {mtime, text}) so repeated turns stay cheap. */
 const fileCache = new Map<string, { mtimeMs: number; text: string }>();
 
+/** A byte range inside the assembled system prompt that maps back to a source file. */
+interface SourceInterval {
+	path: string;
+	dir: string;
+	start: number;
+	end: number;
+}
+
+/**
+ * Resolve a slot position (in the top-level prompt) to its host file's directory.
+ * Returns null when no known source file covers that position.
+ */
+export type HostLookup = (positionInText: number) => string | null;
+
 export default function promptSlotExtension(pi: ExtensionAPI) {
 	// ------------------------------------------------------------------
 	// before_agent_start: expand slots in the system prompt
@@ -69,8 +115,16 @@ export default function promptSlotExtension(pi: ExtensionAPI) {
 		const systemPrompt = event.systemPrompt;
 		if (!systemPrompt || !HAS_SLOT.test(systemPrompt)) return undefined;
 
-		// System prompt slots resolve relative to the project root (cwd).
-		const outcome = await expandText(systemPrompt, [ctx.cwd], 0, new Set());
+		// Build a source index so each slot can be resolved relative to the file
+		// that actually contains it (see module header). Falls back to cwd for
+		// slots we cannot attribute to any known source file.
+		const contextFiles = (event as any).systemPromptOptions?.contextFiles as
+			| Array<{ path: string; content: string }>
+			| undefined;
+		const intervals = await buildSourceIndex(systemPrompt, ctx.cwd, contextFiles);
+		const hostLookup: HostLookup = (pos) => findHostDir(intervals, pos);
+
+		const outcome = await expandText(systemPrompt, [ctx.cwd], 0, new Set(), hostLookup);
 		if (outcome.expansions.length === 0) return undefined;
 
 		notify(ctx, outcome.expansions);
@@ -108,9 +162,15 @@ export default function promptSlotExtension(pi: ExtensionAPI) {
 			} else {
 				display = "(not found)";
 			}
-			out.push(`  • @{${e.ref}}${e.error ? ` [${e.error}]` : ""} → ${display}`);
+			const host = e.host ? ` [host: ${displayPath(e.host, cwd)}]` : "";
+			out.push(`  • @{${e.ref}}${e.error ? ` [${e.error}]` : ""} → ${display}${host}`);
 		}
 		return out;
+	}
+
+	function displayPath(p: string, cwd: string): string {
+		const rel = relativePath(cwd, p);
+		return rel && !rel.startsWith("..") ? rel : p;
 	}
 }
 
@@ -123,12 +183,18 @@ export default function promptSlotExtension(pi: ExtensionAPI) {
  * order; the first existing match wins. Loaded content is scanned again for
  * nested slots, resolved relative to that file's own directory. `visiting`
  * breaks reference cycles and `depth` caps runaway recursion.
+ *
+ * The optional `hostLookup` is applied only at the top-level call: for each
+ * slot, if we can attribute it to a known source file, that file's directory
+ * is prepended to `candidateDirs` for just this one slot. Nested recursion
+ * uses the standard `dirname(resolved)` chain instead.
  */
 export async function expandText(
 	text: string,
 	candidateDirs: string[],
 	depth: number,
 	visiting: Set<string>,
+	hostLookup?: HostLookup,
 ): Promise<ExpandOutcome> {
 	if (depth > MAX_DEPTH) return { text, expansions: [] };
 
@@ -154,13 +220,16 @@ export async function expandText(
 		}
 
 		const ref = expandTilde(rawRef);
+		const hostDir = hostLookup ? hostLookup(start) : null;
+		// Per-slot search path: host dir first (if known), then whatever was passed in.
+		const dirs = hostDir ? [hostDir, ...candidateDirs] : candidateDirs;
 
 		// Locate the file: absolute path as-is, else search candidate dirs.
 		let resolved: string | null = null;
 		if (isAbsolute(ref)) {
 			resolved = (await pathReadable(ref)) ? ref : null;
 		} else {
-			for (const base of candidateDirs) {
+			for (const base of dirs) {
 				const candidate = join(base, ref);
 				if (await pathReadable(candidate)) {
 					resolved = candidate;
@@ -170,28 +239,36 @@ export async function expandText(
 		}
 
 		if (!resolved) {
-			expansions.push({ ref: rawRef, resolved: "", bytes: 0, error: "not found" });
+			expansions.push({ ref: rawRef, resolved: "", bytes: 0, host: hostDir ?? undefined, error: "not found" });
 			parts.push(match[0]); // leave the slot untouched in the output
 			continue;
 		}
 
 		if (visiting.has(resolved)) {
-			expansions.push({ ref: rawRef, resolved, bytes: 0, error: "cycle" });
+			expansions.push({ ref: rawRef, resolved, bytes: 0, host: hostDir ?? undefined, error: "cycle" });
 			parts.push(match[0]);
 			continue;
 		}
 
 		const loaded = await readSlotFile(resolved);
 		if (!loaded) {
-			expansions.push({ ref: rawRef, resolved, bytes: 0, error: "unreadable/too large" });
+			expansions.push({
+				ref: rawRef,
+				resolved,
+				bytes: 0,
+				host: hostDir ?? undefined,
+				error: "unreadable/too large",
+			});
 			parts.push(match[0]);
 			continue;
 		}
 
 		// Recurse: nested slots resolve relative to THIS file's directory first.
+		// hostLookup is NOT propagated — it applies to the top-level assembled
+		// prompt only; nested resolution follows the dirname(resolved) chain.
 		const nextDirs = [dirname(resolved), ...candidateDirs];
 		const inner = await expandText(loaded.text, nextDirs, depth + 1, new Set(visiting).add(resolved));
-		expansions.push({ ref: rawRef, resolved, bytes: loaded.bytes });
+		expansions.push({ ref: rawRef, resolved, bytes: loaded.bytes, host: hostDir ?? undefined });
 		expansions.push(...inner.expansions);
 		parts.push(inner.text);
 	}
@@ -230,4 +307,116 @@ function expandTilde(ref: string): string {
 	if (ref === "~") return homedir();
 	if (ref.startsWith("~/")) return join(homedir(), ref.slice(2));
 	return ref;
+}
+
+// ----------------------------------------------------------------------
+// Source index: map prompt byte ranges back to their originating files
+// ----------------------------------------------------------------------
+
+/**
+ * Build a list of prompt byte ranges that correspond to known source files.
+ * The list is sorted so that narrower/later-added entries win ties in
+ * `findHostDir` (a more specific match should override a broader one).
+ */
+export async function buildSourceIndex(
+	systemPrompt: string,
+	cwd: string,
+	contextFiles?: Array<{ path: string; content: string }>,
+): Promise<SourceInterval[]> {
+	const intervals: SourceInterval[] = [];
+	const seenPaths = new Set<string>();
+
+	// 1. Files pi already knows about (AGENTS.md/CLAUDE.md). Path is authoritative.
+	for (const cf of contextFiles ?? []) {
+		if (!cf?.path || !cf?.content) continue;
+		if (seenPaths.has(cf.path)) continue;
+		if (!HAS_SLOT.test(cf.content)) {
+			// still add — a no-slot host is fine, just useless for lookup.
+			// We skip it to keep intervals lean.
+			seenPaths.add(cf.path);
+			continue;
+		}
+		const start = systemPrompt.indexOf(cf.content);
+		if (start >= 0) {
+			intervals.push({ path: cf.path, dir: dirname(cf.path), start, end: start + cf.content.length });
+			seenPaths.add(cf.path);
+		}
+	}
+
+	// 2. Bounded scan of markdown-ish files under cwd. Only files that
+	//    themselves contain a slot can host one, so we filter aggressively.
+	try {
+		const candidates = await scanMarkdownFiles(cwd);
+		for (const c of candidates) {
+			if (seenPaths.has(c.path)) continue;
+			if (!HAS_SLOT.test(c.content)) continue;
+			const start = systemPrompt.indexOf(c.content);
+			if (start >= 0) {
+				intervals.push({ path: c.path, dir: dirname(c.path), start, end: start + c.content.length });
+				seenPaths.add(c.path);
+			}
+		}
+	} catch {
+		// Scan errors are non-fatal — we just lose the ability to attribute
+		// some slots to their host file; the extension still works via cwd.
+	}
+
+	// Narrower ranges are more specific — sort by (end - start) ASC so
+	// findHostDir picks the tightest containing range first.
+	intervals.sort((a, b) => a.end - a.start - (b.end - b.start));
+	return intervals;
+}
+
+/** Find the tightest source interval containing `pos`, or null. */
+export function findHostDir(intervals: SourceInterval[], pos: number): string | null {
+	for (const iv of intervals) {
+		if (pos >= iv.start && pos < iv.end) return iv.dir;
+	}
+	return null;
+}
+
+/**
+ * Bounded recursive walk under `root`, returning candidate host files
+ * (markdown-ish, small enough, not under skip dirs). Uses the same mtime
+ * cache as slot resolution to stay cheap across turns.
+ */
+async function scanMarkdownFiles(root: string): Promise<Array<{ path: string; content: string }>> {
+	const out: Array<{ path: string; content: string }> = [];
+	let visited = 0;
+
+	async function walk(dir: string, depth: number): Promise<void> {
+		if (depth > SCAN_MAX_DEPTH) return;
+		if (out.length >= SCAN_MAX_FILES) return;
+		let entries: import("node:fs").Dirent[];
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const ent of entries) {
+			if (out.length >= SCAN_MAX_FILES) return;
+			if (ent.name.startsWith(".") && ent.name !== "." && ent.name !== ".pi") {
+				// Skip most dotfiles/dotdirs to avoid dep caches; keep `.pi` because
+				// project prompts often live there.
+				if (ent.isDirectory()) continue;
+			}
+			const full = join(dir, ent.name);
+			if (ent.isDirectory()) {
+				if (SCAN_SKIP_DIRS.has(ent.name)) continue;
+				await walk(full, depth + 1);
+				continue;
+			}
+			if (!ent.isFile()) continue;
+			const dot = ent.name.lastIndexOf(".");
+			const ext = dot >= 0 ? ent.name.slice(dot).toLowerCase() : "";
+			if (!SCAN_INCLUDE_EXT.has(ext)) continue;
+			visited++;
+			const loaded = await readSlotFile(full);
+			if (!loaded) continue;
+			out.push({ path: full, content: loaded.text });
+		}
+	}
+
+	await walk(root, 0);
+	return out;
 }

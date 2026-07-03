@@ -49,20 +49,43 @@ expanded body that only appears later in the `context` event).
 
 ## How paths resolve
 
-The system prompt is a concatenation of several files, so once pi assembles it
-the origin of any given slot can no longer be recovered. Relative paths are
-therefore resolved against the **working directory** (the project root, where
-`AGENTS.md` typically lives). The search order is:
+Each slot resolves **relative to the source file that contains it** whenever
+we can identify that file — the natural, least-surprise behavior. Slots we
+cannot attribute to a known source file fall back to the working directory.
 
-1. The current working directory.
-2. (For nested slots) the directory of the file currently being inlined.
+Because pi assembles the system prompt from several files and drops most of
+the origin metadata by the time extensions see it, we recover the mapping by
+content-matching:
 
-Absolute paths (`/etc/...`) and home-relative paths (`~/notes.md`) are honored
-as-is.
+1. Collect candidate source files — `contextFiles` from
+   `systemPromptOptions` (AGENTS.md / CLAUDE.md pi already tracked), plus a
+   bounded recursive scan of markdown-ish files (`*.md` / `*.markdown` /
+   `*.mdx` / `*.txt`) under the cwd.
+2. For each candidate, `indexOf` its content in the assembled prompt — a
+   hit locates its byte range inside the prompt.
+3. For every `@{...}` slot, look up which range it falls into; if found, the
+   containing file's directory is prepended to the search path *for that
+   slot only*.
+4. Nested slots (a resolved file itself contains `@{...}`) continue to
+   resolve relative to that file's directory, recursively — unchanged.
+5. Slots outside any known range fall back to the working directory.
 
-Expansion happens in the `before_agent_start` hook, once per user prompt, by
-rewriting `event.systemPrompt`. It is idempotent across turns, and an mtime
-cache keeps repeated turns cheap while still picking up your file edits.
+Absolute paths (`/etc/...`) and home-relative paths (`~/notes.md`) are
+honored as-is.
+
+**Scan budget (per handler invocation)**:
+
+| Cap | Value |
+|---|---|
+| Max directory depth | 5 |
+| Max files opened | 800 |
+| Max file size | 512 KB |
+| Skipped dirs | `node_modules`, `.git`, `dist`, `build`, `out`, `.next`, `.turbo`, `.cache`, `.venv`, `venv`, `__pycache__`, `target`, `coverage`, and most dot-directories (except `.pi`) |
+
+An in-memory mtime cache keeps repeated turns cheap and picks up your file
+edits between turns. Expansion happens in the `before_agent_start` hook,
+once per user prompt, by rewriting `event.systemPrompt` — idempotent across
+turns.
 
 ## Recursive resolution & safety
 
@@ -116,7 +139,7 @@ The extension hooks a single pi lifecycle event:
 
 | Hook | Responsibility |
 |------|----------------|
-| `before_agent_start` | Rewrites `event.systemPrompt`, inlining any `@{...}` slots resolved against the cwd. Runs once per user prompt. |
+| `before_agent_start` | Rewrites `event.systemPrompt`. Builds a source index (see "How paths resolve"), then inlines each `@{...}` slot relative to the source file that contains it (or the cwd, if the host can't be identified). Runs once per user prompt. |
 
 See [pi extensions docs](https://pi.dev/docs/extensions) for the full event model.
 
